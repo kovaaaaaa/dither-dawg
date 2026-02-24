@@ -6,6 +6,7 @@ import re
 import shutil
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -15,7 +16,14 @@ from typing import Callable
 import cv2
 import numpy as np
 from PIL import Image, ImageOps, ImageSequence
-from PySide6.QtCore import QSize, Qt, QTimer, QUrl
+from PySide6.QtCore import (
+    QEasingCurve,
+    QPropertyAnimation,
+    QSize,
+    Qt,
+    QTimer,
+    QUrl,
+)
 from PySide6.QtGui import QAction, QBrush, QColor, QDesktopServices, QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -29,9 +37,11 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QGraphicsOpacityEffect,
     QScrollArea,
     QSizePolicy,
     QSlider,
+    QStyledItemDelegate,
     QVBoxLayout,
     QWidget,
 )
@@ -123,6 +133,96 @@ class ZoomScrollArea(QScrollArea):
         super().wheelEvent(event)
 
 
+class AnimatedComboDelegate(QStyledItemDelegate):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._start_time = 0.0
+        self.duration_ms = 220
+        self.stagger_ms = 22
+        self.offset_px = 10
+
+    def start(self) -> None:
+        self._start_time = time.perf_counter()
+
+    def paint(self, painter, option, index) -> None:
+        if self._start_time <= 0:
+            return super().paint(painter, option, index)
+
+        elapsed_ms = (time.perf_counter() - self._start_time) * 1000.0
+        delay = index.row() * self.stagger_ms
+        progress = (elapsed_ms - delay) / float(self.duration_ms)
+        if progress < 0.0:
+            progress = 0.0
+        elif progress > 1.0:
+            progress = 1.0
+        if progress <= 0.0:
+            return
+
+        painter.save()
+        if progress < 1.0:
+            painter.setOpacity(progress)
+            painter.translate(int((1.0 - progress) * self.offset_px), 0)
+        super().paint(painter, option, index)
+        painter.restore()
+
+
+class AnimatedComboBox(QComboBox):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._popup_anim: QPropertyAnimation | None = None
+        self._popup_timer: QTimer | None = None
+
+    def _ensure_delegate(self) -> AnimatedComboDelegate:
+        view = self.view()
+        delegate = getattr(view, "_animated_delegate", None)
+        if delegate is None:
+            delegate = AnimatedComboDelegate(view)
+            view.setItemDelegate(delegate)
+            view._animated_delegate = delegate
+        return delegate
+
+    def _start_item_animation(self) -> None:
+        view = self.view()
+        delegate = self._ensure_delegate()
+        delegate.start()
+
+        if self._popup_timer is not None:
+            self._popup_timer.stop()
+            self._popup_timer.deleteLater()
+
+        timer = QTimer(view)
+        timer.setInterval(16)
+
+        def _tick() -> None:
+            view.viewport().update()
+            rows = view.model().rowCount() if view.model() is not None else 0
+            total_ms = delegate.duration_ms + delegate.stagger_ms * max(0, rows - 1)
+            elapsed_ms = (time.perf_counter() - delegate._start_time) * 1000.0
+            if elapsed_ms >= total_ms:
+                timer.stop()
+                timer.deleteLater()
+                self._popup_timer = None
+
+        timer.timeout.connect(_tick)
+        self._popup_timer = timer
+        timer.start()
+
+    def showPopup(self) -> None:
+        view = self.view()
+        view.setWindowOpacity(0.0)
+        self._start_item_animation()
+        super().showPopup()
+
+        self._popup_anim = QPropertyAnimation(view, b"windowOpacity", view)
+        self._popup_anim.setDuration(240)
+        self._popup_anim.setStartValue(0.0)
+        self._popup_anim.setEndValue(1.0)
+        self._popup_anim.setEasingCurve(QEasingCurve.OutCubic)
+        self._popup_anim.start()
+
+
+
+
 class DitherWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -160,6 +260,10 @@ class DitherWindow(QMainWindow):
         self._update_check_inflight = False
         self._resize_update_pending = False
         self._resize_update_delay_ms = 140
+        self._sidebar_animated = False
+        self._sidebar_min_width = 320
+        self._sidebar_max_width = 380
+        self._animate_preview_next = False
 
         self._build_menu()
 
@@ -171,6 +275,7 @@ class DitherWindow(QMainWindow):
 
         self.preview_area = self._build_preview()
         main_layout.addWidget(self.preview_area, 1)
+        self._setup_preview_animation()
 
         controls = self._build_controls()
         self.control_scroll = QScrollArea()
@@ -178,13 +283,14 @@ class DitherWindow(QMainWindow):
         self.control_scroll.setWidgetResizable(True)
         self.control_scroll.setFrameShape(QFrame.NoFrame)
         self.control_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.control_scroll.setMinimumWidth(320)
-        self.control_scroll.setMaximumWidth(380)
+        self.control_scroll.setMinimumWidth(0)
+        self.control_scroll.setMaximumWidth(0)
         main_layout.addWidget(self.control_scroll, 0)
 
         self._load_presets()
         self._load_starter_image()
         self._schedule_update_check()
+        self._schedule_sidebar_animation()
 
     def _load_starter_image(self) -> None:
         starter_path = Path(__file__).resolve().parent / "dither-dawg-starter-image.png"
@@ -196,29 +302,94 @@ class DitherWindow(QMainWindow):
             self.original_image = image.convert("RGB")
             self._preview_cache_key = None
             self._preview_cache_image = None
+            self._animate_preview_next = True
             self.schedule_update()
         except Exception:
             return
 
     def _style_sheet(self) -> str:
         return """
-        QMainWindow { background: #0f0f10; }
-        QWidget { color: #d6d6d6; font-family: "Segoe UI"; font-size: 10.5pt; }
-        #sidebar { background: #1a1a1a; border: 1px solid #252525; border-radius: 8px; }
-        QLabel#sectionTitle { color: #9aa0a6; font-size: 9.5pt; }
-        QLabel#logo { font-size: 18pt; font-weight: 700; letter-spacing: 1px; }
-        QLabel#version { color: #8d8d8d; font-size: 9pt; letter-spacing: 1.2px; }
-        QLabel#hint { color: #a5a5a5; font-size: 9.5pt; }
-        QPushButton { background: #2a2a2a; border: 1px solid #3a3a3a; padding: 6px 10px; border-radius: 6px; }
-        QPushButton:hover { background: #333333; }
-        QPushButton:pressed { background: #262626; }
-        QComboBox { background: #242424; border: 1px solid #3a3a3a; padding: 4px 8px; border-radius: 6px; }
-        QComboBox::drop-down { border: none; }
-        QSlider::groove:horizontal { height: 6px; background: #2b2b2b; border-radius: 3px; }
-        QSlider::handle:horizontal { width: 14px; margin: -5px 0; background: #cfcfcf; border-radius: 7px; }
+        QMainWindow {
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                stop:0 #0f1012, stop:0.6 #0b0c0f, stop:1 #0a0b0d);
+        }
+        QWidget { color: #d9dadb; font-family: "Bahnschrift", "Segoe UI"; font-size: 10.5pt; }
+        #sidebar {
+            background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                stop:0 #181b1f, stop:1 #121418);
+            border: 1px solid #2a2e34;
+            border-radius: 12px;
+        }
+        QLabel#sectionTitle { color: #9aa6b2; font-size: 9pt; letter-spacing: 0.8px; }
+        QLabel#logo { font-size: 19pt; font-weight: 700; letter-spacing: 2px; color: #f1f3f5; }
+        QLabel#version { color: #8c97a3; font-size: 9pt; letter-spacing: 1.6px; }
+        QLabel#hint { color: #8e9aa6; font-size: 9.5pt; }
+
+        QPushButton {
+            background: #1f2329;
+            border: 1px solid #323842;
+            padding: 7px 12px;
+            border-radius: 8px;
+        }
+        QPushButton:hover { background: #262c34; border-color: #3a424e; }
+        QPushButton:pressed { background: #1b1f25; }
+        QPushButton:disabled { color: #6f7680; background: #171a1f; border-color: #242a33; }
+
+        QComboBox {
+            background: #1f2329;
+            border: 1px solid #323842;
+            padding: 5px 10px;
+            border-radius: 8px;
+        }
+        QComboBox:hover { border-color: #3a424e; }
+        QComboBox::drop-down { border: none; width: 18px; }
+        QComboBox::down-arrow { image: none; border: 2px solid #9aa6b2; width: 6px; height: 6px;
+            border-top: none; border-left: none; margin-right: 8px; }
+        QComboBox QAbstractItemView {
+            background: #14181d;
+            border: 1px solid #2a2f36;
+            padding: 6px;
+            outline: 0;
+            selection-background-color: #2b3440;
+        }
+
+        QSlider::groove:horizontal {
+            height: 6px;
+            background: #262b33;
+            border-radius: 3px;
+        }
+        QSlider::handle:horizontal {
+            width: 16px;
+            margin: -5px 0;
+            background: #e6e9ed;
+            border: 1px solid #2c323b;
+            border-radius: 8px;
+        }
+        QSlider::sub-page:horizontal { background: #3a4a5f; border-radius: 3px; }
+
         QCheckBox { spacing: 8px; }
-        QScrollArea { background: #0b0b0c; border: 1px solid #232323; border-radius: 8px; }
-        QFrame#divider { background: #2a2a2a; max-height: 1px; }
+        QCheckBox::indicator {
+            width: 16px; height: 16px;
+            border-radius: 4px;
+            border: 1px solid #3a4049;
+            background: #171b20;
+        }
+        QCheckBox::indicator:checked {
+            background: #3a4a5f;
+            border-color: #4a5b73;
+        }
+
+        QScrollArea { background: #0b0c0f; border: 1px solid #232833; border-radius: 10px; }
+        QScrollBar:vertical { background: #0b0c0f; width: 10px; margin: 6px 0; border-radius: 5px; }
+        QScrollBar::handle:vertical { background: #2a313b; border-radius: 5px; min-height: 20px; }
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+
+        QMenuBar { background: #0f1114; color: #cfd4da; }
+        QMenuBar::item:selected { background: #1f252d; }
+        QMenu { background: #13171c; color: #d6dbe1; border: 1px solid #2a2f36; }
+        QMenu::item:selected { background: #2b3440; }
+
+        QFrame#divider { background: #2a2f36; max-height: 1px; }
         """
 
     def _build_menu(self) -> None:
@@ -315,6 +486,57 @@ class DitherWindow(QMainWindow):
         area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         return area
 
+    def _setup_preview_animation(self) -> None:
+        self._preview_opacity = QGraphicsOpacityEffect(self.image_label)
+        self.image_label.setGraphicsEffect(self._preview_opacity)
+        self._preview_opacity.setOpacity(1.0)
+        self._preview_fade_anim = QPropertyAnimation(self._preview_opacity, b"opacity", self)
+        self._preview_fade_anim.setDuration(180)
+        self._preview_fade_anim.setEasingCurve(QEasingCurve.OutCubic)
+
+    def _animate_preview_fade(self) -> None:
+        if not hasattr(self, "_preview_fade_anim"):
+            return
+        self._preview_fade_anim.stop()
+        self._preview_opacity.setOpacity(0.0)
+        self._preview_fade_anim.setStartValue(0.0)
+        self._preview_fade_anim.setEndValue(1.0)
+        self._preview_fade_anim.start()
+
+    def _schedule_sidebar_animation(self) -> None:
+        if self._sidebar_animated:
+            return
+        self._sidebar_animated = True
+        QTimer.singleShot(0, self._animate_sidebar_in)
+
+    def _animate_sidebar_in(self) -> None:
+        effect = QGraphicsOpacityEffect(self.control_scroll)
+        self.control_scroll.setGraphicsEffect(effect)
+        effect.setOpacity(0.0)
+
+        width_anim = QPropertyAnimation(self.control_scroll, b"maximumWidth", self)
+        width_anim.setStartValue(0)
+        width_anim.setEndValue(self._sidebar_max_width)
+        width_anim.setDuration(420)
+        width_anim.setEasingCurve(QEasingCurve.OutCubic)
+
+        opacity_anim = QPropertyAnimation(effect, b"opacity", self)
+        opacity_anim.setStartValue(0.0)
+        opacity_anim.setEndValue(1.0)
+        opacity_anim.setDuration(420)
+        opacity_anim.setEasingCurve(QEasingCurve.OutCubic)
+
+        self._sidebar_width_anim = width_anim
+        self._sidebar_opacity_anim = opacity_anim
+
+        width_anim.start()
+        opacity_anim.start()
+        width_anim.finished.connect(self._lock_sidebar_width)
+
+    def _lock_sidebar_width(self) -> None:
+        self.control_scroll.setMinimumWidth(self._sidebar_min_width)
+        self.control_scroll.setMaximumWidth(self._sidebar_max_width)
+
     def _build_controls(self) -> QWidget:
         panel = QWidget()
         panel.setObjectName("sidebar")
@@ -348,7 +570,7 @@ class DitherWindow(QMainWindow):
         layout.addWidget(self._divider())
 
         layout.addWidget(self._section_title("Style"))
-        self.style_combo = QComboBox()
+        self.style_combo = AnimatedComboBox()
         ordered_styles = [
             "Bayer 2x2",
             "Bayer 4x4",
@@ -384,7 +606,7 @@ class DitherWindow(QMainWindow):
         layout.addWidget(self.style_combo)
 
         layout.addWidget(self._section_title("Presets"))
-        self.presets_combo = QComboBox()
+        self.presets_combo = AnimatedComboBox()
         self.presets_combo.addItems(["None"])
         layout.addWidget(self.presets_combo)
 
@@ -405,7 +627,7 @@ class DitherWindow(QMainWindow):
         self._add_slider(layout, self.bleed_slider, self.bleed_value)
 
         layout.addWidget(self._section_title("Palette Category"))
-        self.palette_category_combo = QComboBox()
+        self.palette_category_combo = AnimatedComboBox()
         if self.palette_categories:
             self.palette_category_combo.addItems(self.palette_categories)
         else:
@@ -413,7 +635,7 @@ class DitherWindow(QMainWindow):
         layout.addWidget(self.palette_category_combo)
 
         layout.addWidget(self._section_title("Palette"))
-        self.palette_combo = QComboBox()
+        self.palette_combo = AnimatedComboBox()
         self._populate_palette_combo(self.palette_category_combo.currentText())
         layout.addWidget(self.palette_combo)
 
@@ -751,6 +973,7 @@ class DitherWindow(QMainWindow):
             self.original_image = frames[0]
             self._preview_cache_key = None
             self._preview_cache_image = None
+            self._animate_preview_next = True
             self.schedule_update()
             self._update_export_actions()
             self.video_timer.setInterval(max(20, durations[0]))
@@ -771,6 +994,7 @@ class DitherWindow(QMainWindow):
         self._video_capture = capture
         self._video_mode = "video"
         self._video_path = file_path
+        self._animate_preview_next = True
         self._advance_video_frame()
         self._update_export_actions()
         self.video_timer.start(self._video_interval_ms)
@@ -893,6 +1117,7 @@ class DitherWindow(QMainWindow):
             self.original_image = image.convert("RGB")
             self._preview_cache_key = None
             self._preview_cache_image = None
+            self._animate_preview_next = True
         except Exception as exc:
             QMessageBox.critical(self, "Import Failed", f"Could not open image:\n{exc}")
             return
@@ -1337,6 +1562,9 @@ class DitherWindow(QMainWindow):
         self.processed_image = self._run_dither(preview_source, settings, scale_factor)
 
         self._render_pixmap(self.processed_image)
+        if self._animate_preview_next:
+            self._animate_preview_next = False
+            self._animate_preview_fade()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
